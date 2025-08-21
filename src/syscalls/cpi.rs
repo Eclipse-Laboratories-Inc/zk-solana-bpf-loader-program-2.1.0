@@ -11,12 +11,13 @@ use {
     },
     solana_sdk::{
         saturating_add_assign,
-        stable_layout::stable_instruction::StableInstruction,
         syscalls::{
             MAX_CPI_ACCOUNT_INFOS, MAX_CPI_INSTRUCTION_ACCOUNTS, MAX_CPI_INSTRUCTION_DATA_LEN,
         },
         transaction_context::BorrowedAccount,
     },
+    solana_account_info::AccountInfoEbpfVM,
+    solana_stable_layout::stable_instruction::{StableInstructionEbpfVM, StableInstructionHost},
     std::{mem, ptr},
 };
 
@@ -105,35 +106,19 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
         invoke_context: &InvokeContext,
         memory_mapping: &'b MemoryMapping<'a>,
         _vm_addr: u64,
-        account_info: &AccountInfo,
+        account_info: &AccountInfoEbpfVM,
         account_metadata: &SerializedAccountMetadata,
     ) -> Result<CallerAccount<'a, 'b>, Error> {
         let direct_mapping = invoke_context
             .get_feature_set()
             .is_active(&feature_set::bpf_account_data_direct_mapping::id());
-
-        if direct_mapping {
-            check_account_info_pointer(
-                invoke_context,
-                account_info.key as *const _ as u64,
-                account_metadata.vm_key_addr,
-                "key",
-            )?;
-            check_account_info_pointer(
-                invoke_context,
-                account_info.owner as *const _ as u64,
-                account_metadata.vm_owner_addr,
-                "owner",
-            )?;
-        }
-
         // account_info points to host memory. The addresses used internally are
         // in vm space so they need to be translated.
         let lamports = {
             // Double translate lamports out of RefCell
             let ptr = translate_type::<u64>(
                 memory_mapping,
-                account_info.lamports.as_ptr() as u64,
+                account_info.lamports_vaddr_inner(),
                 invoke_context.get_check_aligned(),
             )?;
             if direct_mapping {
@@ -149,21 +134,23 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
 
         let owner = translate_type_mut::<Pubkey>(
             memory_mapping,
-            account_info.owner as *const _ as u64,
+            account_info.owner_vaddr,
             invoke_context.get_check_aligned(),
         )?;
 
         let (serialized_data, vm_data_addr, ref_to_len_in_vm) = {
+            type StableSlice = (u64, u64); // (data_ptr, data_len)
+
             // Double translate data out of RefCell
-            let data = *translate_type::<&[u8]>(
+            let (vm_data_addr, vm_data_len) = *translate_type::<StableSlice>(
                 memory_mapping,
-                account_info.data.as_ptr() as *const _ as u64,
+                account_info.data_vaddr_inner(),
                 invoke_context.get_check_aligned(),
             )?;
             if direct_mapping {
                 check_account_info_pointer(
                     invoke_context,
-                    data.as_ptr() as u64,
+                    account_info.data_vaddr_inner(),
                     account_metadata.vm_data_addr,
                     "data",
                 )?;
@@ -171,14 +158,14 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
 
             consume_compute_meter(
                 invoke_context,
-                (data.len() as u64)
+                (vm_data_len)
                     .checked_div(invoke_context.get_compute_budget().cpi_bytes_per_unit)
                     .unwrap_or(u64::MAX),
             )?;
 
             let ref_to_len_in_vm = if direct_mapping {
-                let vm_addr = (account_info.data.as_ptr() as *const u64 as u64)
-                    .saturating_add(size_of::<u64>() as u64);
+                let vm_addr =
+                    (account_info.data_vaddr_inner()).saturating_add(size_of::<u64>() as u64);
                 // In the same vein as the other check_account_info_pointer() checks, we don't lock
                 // this pointer to a specific address but we don't want it to be inside accounts, or
                 // callees might be able to write to the pointed memory.
@@ -194,13 +181,11 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
                 let translated = translate(
                     memory_mapping,
                     AccessType::Store,
-                    (account_info.data.as_ptr() as *const u64 as u64)
-                        .saturating_add(size_of::<u64>() as u64),
+                    (account_info.data_vaddr_inner()).saturating_add(size_of::<u64>() as u64),
                     8,
                 )? as *mut u64;
                 VmValue::Translated(unsafe { &mut *translated })
             };
-            let vm_data_addr = data.as_ptr() as u64;
 
             let serialized_data = if direct_mapping {
                 // when direct mapping is enabled, the permissions on the
@@ -220,7 +205,7 @@ impl<'a, 'b> CallerAccount<'a, 'b> {
                 translate_slice_mut::<u8>(
                     memory_mapping,
                     vm_data_addr,
-                    data.len() as u64,
+                    vm_data_len,
                     invoke_context.get_check_aligned(),
                 )?
             };
@@ -368,7 +353,7 @@ trait SyscallInvokeSigned {
         addr: u64,
         memory_mapping: &MemoryMapping,
         invoke_context: &mut InvokeContext,
-    ) -> Result<StableInstruction, Error>;
+    ) -> Result<StableInstructionHost, Error>;
     fn translate_accounts<'a, 'b>(
         instruction_accounts: &[InstructionAccount],
         program_indices: &[IndexOfAccount],
@@ -416,22 +401,22 @@ impl SyscallInvokeSigned for SyscallInvokeSignedRust {
         addr: u64,
         memory_mapping: &MemoryMapping,
         invoke_context: &mut InvokeContext,
-    ) -> Result<StableInstruction, Error> {
-        let ix = translate_type::<StableInstruction>(
+    ) -> Result<StableInstructionHost, Error> {
+        let ix = translate_type::<StableInstructionEbpfVM>(
             memory_mapping,
             addr,
             invoke_context.get_check_aligned(),
         )?;
         let account_metas = translate_slice::<AccountMeta>(
             memory_mapping,
-            ix.accounts.as_ptr() as u64,
-            ix.accounts.len() as u64,
+            ix.accounts.vaddr,
+            ix.accounts.len,
             invoke_context.get_check_aligned(),
         )?;
         let data = translate_slice::<u8>(
             memory_mapping,
-            ix.data.as_ptr() as u64,
-            ix.data.len() as u64,
+            ix.data.vaddr,
+            ix.data.len,
             invoke_context.get_check_aligned(),
         )?
         .to_vec();
@@ -465,7 +450,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedRust {
             accounts.push(account_meta.clone());
         }
 
-        Ok(StableInstruction {
+        Ok(StableInstructionHost {
             accounts: accounts.into(),
             data: data.into(),
             program_id: ix.program_id,
@@ -484,7 +469,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedRust {
         let (account_infos, account_info_keys) = translate_account_infos(
             account_infos_addr,
             account_infos_len,
-            |account_info: &AccountInfo| account_info.key as *const _ as u64,
+            |account_info: &AccountInfoEbpfVM| account_info.key_vaddr,
             memory_mapping,
             invoke_context,
         )?;
@@ -632,7 +617,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedC {
         addr: u64,
         memory_mapping: &MemoryMapping,
         invoke_context: &mut InvokeContext,
-    ) -> Result<StableInstruction, Error> {
+    ) -> Result<StableInstructionHost, Error> {
         let ix_c = translate_type::<SolInstruction>(
             memory_mapping,
             addr,
@@ -701,7 +686,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedC {
             });
         }
 
-        Ok(StableInstruction {
+        Ok(StableInstructionHost {
             accounts: accounts.into(),
             data: data.into(),
             program_id: *program_id,
@@ -2764,12 +2749,12 @@ mod tests {
         fn into_region(self, vm_addr: u64) -> (Vec<u8>, MemoryRegion) {
             let accounts_len = mem::size_of::<AccountMeta>() * self.accounts.len();
 
-            let size = mem::size_of::<StableInstruction>() + accounts_len + self.data.len();
+            let size = mem::size_of::<StableInstructionHost>() + accounts_len + self.data.len();
 
             let mut data = vec![0; size];
 
             let vm_addr = vm_addr as usize;
-            let accounts_addr = vm_addr + mem::size_of::<StableInstruction>();
+            let accounts_addr = vm_addr + mem::size_of::<StableInstructionHost>();
             let data_addr = accounts_addr + accounts_len;
 
             let ins = Instruction {
@@ -2785,7 +2770,7 @@ mod tests {
                     Vec::from_raw_parts(data_addr as *mut _, self.data.len(), self.data.len())
                 },
             };
-            let ins = StableInstruction::from(ins);
+            let ins = StableInstructionHost::from(ins);
 
             unsafe {
                 ptr::write_unaligned(data.as_mut_ptr().cast(), ins);

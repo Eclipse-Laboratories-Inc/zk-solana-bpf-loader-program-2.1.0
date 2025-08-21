@@ -39,7 +39,6 @@ use {
         vm::Config,
     },
     solana_sdk::{
-        account_info::AccountInfo,
         big_mod_exp::{big_mod_exp, BigModExpParams},
         blake3, bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
         entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, SUCCESS},
@@ -542,13 +541,21 @@ fn translate_type_inner<'a, T>(
 ) -> Result<&'a mut T, Error> {
     let host_addr = translate(memory_mapping, access_type, vm_addr, size_of::<T>() as u64)?;
     if !check_aligned {
-        Ok(unsafe { std::mem::transmute::<u64, &mut T>(host_addr) })
+        // Earlier implementation:
+        // Ok(unsafe { std::mem::transmute::<u64, &mut T>(host_addr) })
+
+        // Here may go an alternate solution
+        let align_of_t = align_of::<T>() as u64;
+        assert!(host_addr % align_of_t == 0);
+        // Do the unsafe cast, guarded by manual alignment check
+        Ok(unsafe { &mut *(host_addr as *mut T) })
     } else if !address_is_aligned::<T>(host_addr) {
         Err(SyscallError::UnalignedPointer.into())
     } else {
         Ok(unsafe { &mut *(host_addr as *mut T) })
     }
 }
+
 fn translate_type_mut<'a, T>(
     memory_mapping: &MemoryMapping,
     vm_addr: u64,
@@ -2140,7 +2147,7 @@ mod tests {
             instruction::Instruction,
             program::check_type_assumptions,
             slot_hashes::{self, SlotHashes},
-            stable_layout::stable_instruction::StableInstruction,
+            stable_layout::stable_instruction::StableInstructionHost,
             stake_history::{self, StakeHistory, StakeHistoryEntry},
             sysvar::{
                 self, clock::Clock, epoch_rewards::EpochRewards, epoch_schedule::EpochSchedule,
@@ -2255,12 +2262,12 @@ mod tests {
             &"foobar",
             vec![AccountMeta::new(solana_sdk::pubkey::new_rand(), false)],
         );
-        let instruction = StableInstruction::from(instruction);
+        let instruction = StableInstructionHost::from(instruction);
         let memory_region = MemoryRegion::new_readonly(bytes_of(&instruction), 0x100000000);
         let memory_mapping =
             MemoryMapping::new(vec![memory_region], &config, &SBPFVersion::V2).unwrap();
         let translated_instruction =
-            translate_type::<StableInstruction>(&memory_mapping, 0x100000000, true).unwrap();
+            translate_type::<StableInstructionHost>(&memory_mapping, 0x100000000, true).unwrap();
         assert_eq!(instruction, *translated_instruction);
 
         let memory_region = MemoryRegion::new_readonly(&bytes_of(&instruction)[..1], 0x100000000);
